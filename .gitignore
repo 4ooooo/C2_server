@@ -1,1 +1,4 @@
 c2_server.exe
+go.mod
+go.sum
+*.exe
