@@ -713,26 +713,51 @@ func (c *Controller) parseDNSResponse(data []byte) (string, error) {
 	dataLength := binary.BigEndian.Uint16(data[offset : offset+2])
 	offset += 2
 
-	// 读取TXT记录数据
+	// 读取TXT记录数据，支持分块数据
 	if offset+int(dataLength) > len(data) {
 		return "", fmt.Errorf("TXT记录数据不足")
 	}
 
-	// TXT记录格式：长度前缀 + 数据
-	txtLength := int(data[offset])
-	offset++
+	var encodedData strings.Builder
+	remainingLength := int(dataLength)
 
-	if txtLength > int(dataLength)-1 {
-		return "", fmt.Errorf("TXT记录长度不正确")
+	// 读取所有TXT记录分块
+	for remainingLength > 0 {
+		if offset >= len(data) {
+			return "", fmt.Errorf("TXT记录数据不完整")
+		}
+
+		// 读取当前分块长度
+		txtLength := int(data[offset])
+		offset++
+		remainingLength--
+
+		if txtLength > remainingLength {
+			return "", fmt.Errorf("TXT记录长度不正确: %d > %d", txtLength, remainingLength)
+		}
+
+		if offset+txtLength > len(data) {
+			return "", fmt.Errorf("TXT记录实际数据不足")
+		}
+
+		// 读取当前分块数据
+		chunkData := string(data[offset : offset+txtLength])
+		encodedData.WriteString(chunkData)
+
+		offset += txtLength
+		remainingLength -= txtLength
+
+		fmt.Printf("[调试] 读取TXT分块，长度: %d，累计长度: %d\n", txtLength, encodedData.Len())
 	}
 
-	encodedData := string(data[offset : offset+txtLength])
+	fmt.Printf("[调试] 总编码数据长度: %d\n", encodedData.Len())
 
 	// 解码base64数据
-	result, err := decodeBase64(encodedData)
+	result, err := decodeBase64(encodedData.String())
 	if err != nil {
 		return "", fmt.Errorf("解码响应数据失败: %w", err)
 	}
 
+	fmt.Printf("[调试] 解码后结果长度: %d 字符\n", len(result))
 	return result, nil
 }
