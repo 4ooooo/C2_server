@@ -3,3 +3,4 @@ go.sum
 *.exe
 .gitignore
 c2_server
+c2_server_linux

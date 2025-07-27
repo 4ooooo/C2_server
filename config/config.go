@@ -6,11 +6,13 @@ import (
 )
 
 type Config struct {
-	Port string `json:"port"`
+	TCPPort string `json:"tcp_port"`
+	DNSPort string `json:"dns_port"`
 }
 
 var config Config
-var ServerPort string
+var TCPServerPort string
+var DNSServerPort string
 
 const configFilePath = "config.json"
 
@@ -24,6 +26,7 @@ func Config_Init() error {
 	if err != nil {
 		return err
 	}
-	ServerPort = ":" + string(config.Port)
+	TCPServerPort = ":" + config.TCPPort
+	DNSServerPort = ":" + config.DNSPort
 	return nil
 }

